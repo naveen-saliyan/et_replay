@@ -29,7 +29,8 @@ if torch.xpu.is_available():
     is_tensor,
     is_tensor_list,
     generate_prefix,
-    generate_suffix
+    generate_suffix,
+    TORCH_DTYPES_RNG_str
     )
   
   
@@ -92,15 +93,16 @@ class ExgrReplayManager:
         self.commsParams = None
         self.regenerate_tensors = None
 
-        self.cuda = "cuda"
-        self.xpu = "xpu"
+        self.cuda = None
+        self.xpu = None
 
         if torch.cuda.is_available():
-            self.device = torch.device(self.cuda)
-        
-        if torch.xpu.is_available():
-            self.device = torch.device(self.xpu)
-
+            self.cuda = 'cuda'
+            self.device = torch.device(self.cuda)        
+        elif torch.xpu.is_available():
+            self.xpu = 'xpu'
+            self.device = torch.device(self.xpu)           
+            
         # Permanent registry of the tensors that need to be initialized.
         self.tensor_registry_permanent = {}
         # Registry of all input tensors.
@@ -641,6 +643,8 @@ class ExgrReplayManager:
         if is_fbgemm_forward(node):
             if self.cpu:
                 func, output_count = build_fbgemm_func(node, "cpu", self.args.rows)
+            if self.xpu:               
+                func, output_count = build_fbgemm_func(node, self.xpu, self.args.rows)    
             else:
                 func, output_count = build_fbgemm_func(node, self.cuda, self.args.rows)
             self.fbgemm_backward_ops.append((func.backward, node.id))
@@ -659,8 +663,9 @@ class ExgrReplayManager:
         def _generate_tensor_allocation_str():
             tensor_allocation_str = ""
             unallocated_tensor_allocation_str = ""
-            unallocated_tensors = set()
-            tensor_allocate_template = """{tensor} = {rng}({shape}).to({dtype}){cuda}"""
+            unallocated_tensors = set()            
+            tensor_allocate_template = """{tensor} = {rng}({shape}).to({dtype}){device}"""            
+               
             for node in self.sorted_nodes:
                 if node.name == "record_param_comms" and (
                     self.compute_only or self.args.separate
@@ -672,6 +677,16 @@ class ExgrReplayManager:
                         input_args, _ = generate_fbgemm_tensors(
                             node,
                             "cpu",
+                            self.args.rows,
+                            self.args.pooling_factor,
+                            self.args.alpha,
+                        )
+                    elif self.xpu:
+                        print ("inside fbgemm setting XPU")
+                        tensor_allocation_str += f'input_args, _ = generate_fbgemm_tensors(nodes[{node.id}], "{self.xpu}", {self.args.rows}, {self.args.pooling_factor}, {self.args.alpha})\n'
+                        input_args, _ = generate_fbgemm_tensors(
+                            node,
+                            self.xpu,
                             self.args.rows,
                             self.args.pooling_factor,
                             self.args.alpha,
@@ -732,13 +747,21 @@ class ExgrReplayManager:
                                     ]
                                 tensor_str = f"tensor_{replay_t_id}"
                                 shape_str = "[" + ", ".join(str(d) for d in shape) + "]"
-                                cuda_str = ""
+                                device_str = ""
                                 if not self.cpu:
                                     if self.tensor_with_device:
-                                        if self.tensor_device[replay_t_id] != "cpu":
-                                            cuda_str = f'.cuda("{self.cuda}")'
+                                        tensor_device = self.tensor_device[replay_t_id]
+                                        if tensor_device != "cpu":
+                                            if 'cuda' in tensor_device:
+                                                device_str = f'.cuda("{self.cuda}")'
+                                            elif 'xpu' in tensor_device:
+                                                device_str = f'.xpu("{self.xpu}")'
+
                                     elif replay_t_id not in self.cpu_tensor:
-                                        cuda_str = f'.cuda("{self.cuda}")'
+                                        if torch.cuda.is_available():                                        
+                                            device_str = f'.cuda("{self.cuda}")'
+                                        else:
+                                            device_str = f'.xpu("{self.xpu}")'
 
                                 tensor_allocation_str += f"global {tensor_str}\n"
                                 tensor_allocation_str += (
@@ -747,7 +770,7 @@ class ExgrReplayManager:
                                         rng=rng_str,
                                         shape=shape_str,
                                         dtype=dtype_str,
-                                        cuda=cuda_str,
+                                        device=device_str,
                                     )
                                     + "\n"
                                 )
@@ -1015,7 +1038,6 @@ class ExgrReplayManager:
             print(f"Intermediate benchmark file dumped to {self.dump_path}")
             with open(self.dump_path, "w") as f:
                 print(code_str, file=f)
-        print(code_str)
         exec(code_str)
 
     def get_inputs(self, node):
@@ -1487,8 +1509,7 @@ class ExgrReplayManager:
 
         print("Replay time per iteration: {:.2f} ms".format(total_time / self.numIters))
 
-        print(
-            "Operator coverage: {} / {} = {}".format(
+        print("Operator coverage: {} / {} = {}".format(
                 len(self.sorted_nodes),
                 len(self.sorted_nodes) + self.actual_skip_nodes_cnt,
                 len(self.sorted_nodes)
